@@ -1,16 +1,24 @@
 # dsh-auto-shutdown
 
-DeepSeek Harness plugin: **shut the DSH instance down as soon as the web UI disconnects.**
+DeepSeek Harness plugin: **shut the DSH instance down once the web UI stays
+disconnected past a short grace period.**
 
 ## How it works
 
 Every browser page keeps one WebSocket mux open at `/api/remote.mux` and pumps the
 `$events` logical stream for the whole page lifetime. The host
-`ctx.typertGateway.remoteEventClients` map holds one entry per live `$events` stream and
-removes it the moment the socket closes. This plugin polls that map and, when it reaches
-zero UI clients, requests a graceful instance exit through the launcher's `ctx.appExit`
-(the same channel `--help` and SDK stdin-EOF use; the launcher disposes the tree and
-force-exits after 5s at most).
+`ctx.typertGateway.remoteEventClients` map holds one entry per live `$events` stream;
+the entry goes away when that stream ends. This plugin polls the map and, once it has
+seen zero entries for `disconnectGraceMs`, requests a graceful instance exit through the
+launcher's `ctx.appExit` (the same channel `--help` and SDK stdin-EOF use).
+
+`ctx.appExit` is `createProcessShutdown().shutdown(code)`: it arms a 5s force-exit timer
+and disposes the tree, but when dispose **succeeds** that timer is cleared and only
+`process.exitCode` is set — the process then exits solely when the event loop drains,
+which nothing guarantees. The force-exit happens only if dispose times out or rejects.
+This plugin therefore arms its own `unref()`'d `process.exit(0)` fallback (8s) *before*
+calling `appExit(0)`; the fallback is deliberately not cleared on dispose, because the
+tree disposal triggered by `appExit` disposes this plugin too.
 
 ## Install
 
@@ -36,7 +44,7 @@ Example patch overlay:
 ```yaml
 - id: auto-shutdown
   config:
-    disconnectGraceMs: 2000
+    disconnectGraceMs: 30000
 ```
 
 ## Caveats
@@ -45,4 +53,9 @@ Example patch overlay:
   gap; with `disconnectGraceMs: 0` the instance exits if a poll lands inside it.
 - Dead tabs (machine sleep, hard network drop) are detected via the mux heartbeat
   (2s ping, 2 missed pongs), so detection can take a few seconds in that case.
-- Multiple tabs: any live tab keeps the instance alive.
+- **An entry tracks one `$events` stream, not one page**, and the map can be emptied
+  with every page still open: if the forwarded event source is deregistered or errors
+  out, the gateway ends all queued clients at once — and after an error no new `$events`
+  stream can be opened at all, so the count stays at zero.
+- Multiple tabs: any live tab keeps the instance alive — but only while every live tab
+  still owns a live `$events` stream (see the previous point).
