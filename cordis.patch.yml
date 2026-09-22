@@ -1,0 +1,14 @@
+# dsh-auto-shutdown bundle patch: terminate the DSH instance as soon as
+# the web UI disconnects. This row is inserted into the composed tree as a
+# host-plane plugin; override any value in your own cordis.patch.yml layer.
+# inject waits for the typert-gateway row (dsh-base layer) to provide its
+# service, so apply always sees ctx.typertGateway.remoteEventClients.
+- insert:
+    - id: auto-shutdown
+      name: dsh-auto-shutdown
+      inject: [typertGateway]
+      config:
+        enabled: true
+        pollMs: 1000
+        disconnectGraceMs: 0
+        requireEverConnected: true
