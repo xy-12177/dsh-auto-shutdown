@@ -28,7 +28,7 @@ the first UI connection.
 | --- | --- | --- |
 | `enabled` | `true` | master switch |
 | `pollMs` | `1000` | UI-presence sampling interval |
-| `disconnectGraceMs` | `0` | zero-UI persistence before exit (0 = exit on first poll observing the disconnect) |
+| `disconnectGraceMs` | `5000` | zero-UI persistence before exit; covers a tab reload or a brief machine sleep (set `0` to exit on the first poll observing the disconnect) |
 | `requireEverConnected` | `true` | arm only after the UI connected at least once (never-connected boots like `--no-open` are never killed); set `false` to also exit when no UI ever connects |
 
 Example patch overlay:
@@ -41,9 +41,8 @@ Example patch overlay:
 
 ## Caveats
 
-- A browser **tab reload** briefly drops the WebSocket; with `disconnectGraceMs: 0` the
-  instance may exit if the poll lands inside that gap. Set `disconnectGraceMs: 2000` to
-  make reloads safe.
+- A browser **tab reload** briefly drops the WebSocket. The `5000` default covers that
+  gap; with `disconnectGraceMs: 0` the instance exits if a poll lands inside it.
 - Dead tabs (machine sleep, hard network drop) are detected via the mux heartbeat
   (2s ping, 2 missed pongs), so detection can take a few seconds in that case.
 - Multiple tabs: any live tab keeps the instance alive.

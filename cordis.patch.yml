@@ -10,5 +10,4 @@
       config:
         enabled: true
         pollMs: 1000
-        disconnectGraceMs: 0
         requireEverConnected: true
