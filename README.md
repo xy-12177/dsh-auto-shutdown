@@ -11,6 +11,17 @@ once the web UI stays disconnected past a short grace period.
 - Windows 10 / 11，Windows PowerShell 5.1（系统自带）
 - Node.js，并已全局安装 dsh：`npm i -g @deepseek-ai/dsh`
 
+## 兼容性
+
+`package.json` 的 `engines.dsh` 声明为 `>=0.2.1-rc.1 <0.3.0-0`。实测环境：
+
+| dsh 运行时 | 结果 |
+| --- | --- |
+| `0.2.1-rc.2` | 已通过：`dsh web` 隔离实例启动成功，日志打印 `auto-shutdown: active` |
+
+依赖的宿主接口（`ctx.typertGateway.remoteEventClients`、`ctx.appExit`）在 `0.2.1-rc.2` 仍在。
+dsh 在启动时会用 `engines.dsh` 校验插件；不在范围内会被整包跳过，因此升级 dsh 后请对照上表复核。
+
 ## 安装
 
 ```powershell
