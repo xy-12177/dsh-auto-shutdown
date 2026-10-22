@@ -1,7 +1,7 @@
 {
   "name": "dsh-auto-shutdown",
-  "version": "0.2.0",
-  "description": "Automatically shut down DSH after the web UI disconnects, with a Windows exit progress window.",
+  "version": "0.2.1",
+  "description": "Automatically shut down DSH with an animated waving whale and a goodbye speech bubble on Windows.",
   "type": "module",
   "scripts": {
     "test": "node --test tests/*.test.js",

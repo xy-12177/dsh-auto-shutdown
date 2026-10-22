@@ -1,542 +1,275 @@
 using System;
-using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
-using System.Drawing.Text;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
-public class DshProgressForm : Form {
-    [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
-    [DllImport("dwmapi.dll")] private static extern int DwmExtendFrameIntoClientArea(IntPtr h, ref Margins m);
-    [StructLayout(LayoutKind.Sequential)] private struct Margins { public int L, R, T, B; }
+// Small per-pixel-alpha desktop greeting. The mascot is split at runtime into
+// a static body and a masked hand/cuff layer; only that layer rotates.
+public sealed class DshProgressForm : Form {
+    [StructLayout(LayoutKind.Sequential)] private struct BlendFunction {
+        public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct PointNative { public int X, Y; public PointNative(int x, int y) { X=x; Y=y; } }
+    [StructLayout(LayoutKind.Sequential)] private struct SizeNative { public int Width, Height; public SizeNative(int w, int h) { Width=w; Height=h; } }
+    [StructLayout(LayoutKind.Sequential)] private struct BitmapInfoHeader {
+        public uint Size; public int Width, Height; public ushort Planes, BitCount; public uint Compression, SizeImage;
+        public int XPelsPerMeter, YPelsPerMeter; public uint ClrUsed, ClrImportant;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct BitmapInfo { public BitmapInfoHeader Header; public uint Colors; }
 
-    public string Title = "";
-    public string Stage = "";
-    private int _shown;
-    private int _lastSecond = -1;
-    private string _lastTimeText = "";
-    private readonly DateTime _start = DateTime.Now;
-    private readonly Bitmap _logo, _mascot, _wordmark;
-    private Bitmap _background;
-    private Bitmap _stageArt, _timeArt;
-    private float _stageInkRight;
-    private float _dotPhase;
-    private bool _isLoading;
-    private Rectangle _dotBounds = Rectangle.Empty;
-    private readonly float _k;
-    private readonly Color _bg, _bgEnd, _track, _edge;
+    [DllImport("user32.dll", SetLastError=true)] private static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr screenDc, ref PointNative dst, ref SizeNative size, IntPtr sourceDc, ref PointNative src, int colorKey, ref BlendFunction blend, int flags);
+    [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
+    [DllImport("gdi32.dll", SetLastError=true)] private static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32.dll")] private static extern bool DeleteDC(IntPtr dc);
+    [DllImport("gdi32.dll")] private static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+    [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr obj);
+    [DllImport("gdi32.dll", SetLastError=true)] private static extern IntPtr CreateDIBSection(IntPtr dc, ref BitmapInfo info, uint usage, out IntPtr bits, IntPtr section, uint offset);
+
+    private const int CanvasWidth = 420, CanvasHeight = 370;
+    private const int MascotX = 126, MascotY = 43, MascotWidth = 280, MascotHeight = 318;
+    private readonly float _scale;
     private readonly bool _dark;
-    private static readonly Color Accent1 = Color.FromArgb(92, 124, 255);
-    private static readonly Color Accent2 = Color.FromArgb(140, 109, 236);
-    private readonly System.Windows.Forms.Timer _tick;
-    private Size _regionSize = Size.Empty;
-    private bool _updatingRegion;
+    private readonly Bitmap _mascot, _body, _waveLayer, _frame;
+    private readonly Graphics _frameGraphics;
+    private readonly Font _bubbleFont;
+    private readonly System.Windows.Forms.Timer _animation;
+    private readonly DateTime _animationStart = DateTime.UtcNow;
+    private readonly IntPtr _memoryDc, _dib, _dibBits, _previousObject;
+    private bool _nativeReady;
+    private bool _resourcesReleased;
+    private string _title, _stage;
+    private int _shown;
+    private readonly Color _bubbleFill, _bubbleEdge, _bubbleInk;
+
+    public string Title { get { return _title; } }
+    public string Stage { get { return _stage; } }
+    public float DpiScale { get { return _scale; } }
 
     public DshProgressForm(string title, string stage, string logoPath, string mascotPath) {
-        Title = title; Stage = stage;
-        bool dark = false;
-        try {
-            object v = Microsoft.Win32.Registry.GetValue(
-                @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-                "AppsUseLightTheme", 1);
-            dark = v is int && (int)v == 0;
-        } catch { }
-        _dark = dark;
-        _bg = dark ? Color.FromArgb(34, 36, 44) : Color.FromArgb(255, 255, 255);
-        _bgEnd = dark ? Color.FromArgb(40, 43, 54) : Color.FromArgb(246, 249, 255);
-        _track = dark ? Color.FromArgb(61, 64, 76) : Color.FromArgb(229, 234, 245);
-        _edge = dark ? Color.FromArgb(63, 67, 80) : Color.FromArgb(231, 235, 244);
-        // Read system DPI without creating this Form's HWND. CreateGraphics()
-        // here fires OnHandleCreated before the final ClientSize is assigned.
-        using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) { _k = g.DpiX / 96f; }
+        _title = title ?? ""; _stage = stage ?? "";
+        object theme = null;
+        try { theme = Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme", 1); } catch { }
+        _dark = theme is int && (int)theme == 0;
+        _bubbleFill = _dark ? Color.FromArgb(34, 39, 53) : Color.FromArgb(250, 253, 255);
+        _bubbleEdge = _dark ? Color.FromArgb(119, 170, 247) : Color.FromArgb(112, 164, 246);
+        _bubbleInk = _dark ? Color.FromArgb(234, 241, 255) : Color.FromArgb(49, 76, 132);
+        using (Graphics screen = Graphics.FromHwnd(IntPtr.Zero)) { _scale = screen.DpiX / 96f; }
 
-        _logo = LoadFitted(logoPath, S(42), S(42));
-        _mascot = LoadFitted(mascotPath, S(307), S(348));
-        if (_mascot == null && !string.IsNullOrEmpty(mascotPath))
-            _mascot = LoadFitted(Path.Combine(Path.GetDirectoryName(mascotPath) ?? "", "deepseek-logo.png"), S(307), S(348));
-
-        Text = title;
+        _mascot = LoadImage(mascotPath);
+        if (_mascot == null) throw new FileNotFoundException("The goodbye mascot image could not be loaded.", mascotPath);
+        _body = BuildBody(_mascot);
+        _waveLayer = BuildWaveLayer(_mascot);
+        ClientSize = new Size(S(CanvasWidth), S(CanvasHeight));
+        Text = _title;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
-        TopMost = false;
         StartPosition = FormStartPosition.Manual;
-        BackColor = _bg;
-        ClientSize = new Size(S(760), S(360));
-        _wordmark = BuildWordmark(Title, S(340), S(49), dark);
-        string displayStage = NormalizeStage(Stage);
-        _isLoading = !IsTerminalStage(0, displayStage);
-        _stageArt = BuildFooterArtwork(displayStage, S(430), S(36), S(24), dark, false, _isLoading, true, out _stageInkRight);
-        _dotBounds = GetDotBounds();
-        UpdateTimeArtwork();
-        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
-                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-        _background = BuildBackground(ClientSize.Width, ClientSize.Height);
-        _tick = new System.Windows.Forms.Timer();
-        _tick.Interval = 100;
-        _tick.Tick += delegate(object s, EventArgs e) {
-            int second = (int)(DateTime.Now - _start).TotalSeconds;
-            if (second != _lastSecond) {
-                _lastSecond = second;
-                UpdateTimeArtwork();
+        TopMost = false;
+        BackColor = Color.Magenta;
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        _frame = new Bitmap(ClientSize.Width, ClientSize.Height, PixelFormat.Format32bppPArgb);
+        _frameGraphics = Graphics.FromImage(_frame);
+        _frameGraphics.SmoothingMode = SmoothingMode.AntiAlias;
+        _frameGraphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        _frameGraphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        _frameGraphics.CompositingQuality = CompositingQuality.HighQuality;
+        _bubbleFont = new Font("Microsoft YaHei UI", S(25), FontStyle.Bold, GraphicsUnit.Pixel);
+
+        _memoryDc = CreateCompatibleDC(IntPtr.Zero);
+        if (_memoryDc == IntPtr.Zero) throw new InvalidOperationException("Could not create layered-window memory DC.");
+        BitmapInfo info = new BitmapInfo();
+        info.Header.Size = (uint)Marshal.SizeOf(typeof(BitmapInfoHeader));
+        info.Header.Width = ClientSize.Width; info.Header.Height = -ClientSize.Height;
+        info.Header.Planes = 1; info.Header.BitCount = 32; info.Header.Compression = 0;
+        _dib = CreateDIBSection(IntPtr.Zero, ref info, 0, out _dibBits, IntPtr.Zero, 0);
+        if (_dib == IntPtr.Zero || _dibBits == IntPtr.Zero) throw new InvalidOperationException("Could not create layered-window bitmap.");
+        _previousObject = SelectObject(_memoryDc, _dib);
+
+        _animation = new System.Windows.Forms.Timer();
+        _animation.Interval = 50; // 20 fps; all scene elements are cached.
+        _animation.Tick += delegate { UpdateLayeredFrame(CurrentWaveAngle()); };
+        Shown += delegate { UpdateLayeredFrame(CurrentWaveAngle()); _animation.Start(); };
+    }
+
+    private int S(float value) { return (int)Math.Round(value * _scale); }
+    protected override bool ShowWithoutActivation { get { return true; } }
+    protected override CreateParams CreateParams {
+        get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x00080000 | 0x00000080 | 0x08000000; return cp; }
+    }
+
+    private static Bitmap LoadImage(string path) {
+        if (String.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+        using (MemoryStream ms = new MemoryStream(File.ReadAllBytes(path)))
+        using (Image source = Image.FromStream(ms)) {
+            Bitmap copy = new Bitmap(source.Width, source.Height, PixelFormat.Format32bppPArgb);
+            using (Graphics g = Graphics.FromImage(copy)) {
+                g.CompositingMode = CompositingMode.SourceCopy;
+                g.DrawImage(source, new Rectangle(0, 0, copy.Width, copy.Height));
             }
-            if (_isLoading) {
-                _dotPhase += 0.42f;
-                if (_dotPhase >= (float)(Math.PI * 2.0)) _dotPhase -= (float)(Math.PI * 2.0);
-                if (!_dotBounds.IsEmpty) Invalidate(_dotBounds);
-            }
+            return copy;
+        }
+    }
+
+    // This contour severs the open hand and its ruffled cuff at the wrist.
+    // Coordinates are in the source illustration's 1178 x 1335 pixel space.
+    private static GraphicsPath WaveMask(int width, int height) {
+        PointF[] source = new PointF[] {
+            new PointF(205,574), new PointF(212,565), new PointF(214,550), new PointF(225,540),
+            new PointF(228,529), new PointF(241,529), new PointF(248,539), new PointF(259,527),
+            new PointF(272,534), new PointF(282,548), new PointF(294,557), new PointF(307,570),
+            new PointF(321,582), new PointF(333,596), new PointF(335,610), new PointF(328,623),
+            new PointF(316,631), new PointF(308,642), new PointF(300,653), new PointF(287,660),
+            new PointF(273,655), new PointF(260,646), new PointF(249,637), new PointF(239,626),
+            new PointF(229,615), new PointF(220,602), new PointF(211,590)
         };
-        _tick.Start();
+        float sx = width / 1178f, sy = height / 1335f;
+        PointF[] scaled = new PointF[source.Length];
+        for (int i=0;i<source.Length;i++) scaled[i] = new PointF(source[i].X*sx, source[i].Y*sy);
+        GraphicsPath path = new GraphicsPath(); path.AddPolygon(scaled); return path;
     }
 
-    private int S(float v) { return (int)Math.Round(v * _k); }
-
-    private static Bitmap LoadFitted(string path, int width, int height) {
-        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
-        try {
-            using (MemoryStream ms = new MemoryStream(File.ReadAllBytes(path)))
-            using (Image source = Image.FromStream(ms)) {
-                Bitmap result = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
-                using (Graphics g = Graphics.FromImage(result)) {
-                    g.Clear(Color.Transparent);
-                    g.CompositingMode = CompositingMode.SourceCopy;
-                    g.CompositingQuality = CompositingQuality.HighQuality;
-                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    g.SmoothingMode = SmoothingMode.HighQuality;
-                    float scale = Math.Min((float)width / source.Width, (float)height / source.Height);
-                    int dw = (int)Math.Round(source.Width * scale), dh = (int)Math.Round(source.Height * scale);
-                    g.DrawImage(source, new Rectangle((width-dw)/2, (height-dh)/2, dw, dh));
-                }
-                return result;
-            }
-        } catch { return null; }
-    }
-
-    private static Bitmap BuildWordmark(string text, int width, int height, bool dark) {
-        Bitmap bitmap = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
-        try {
-            using (Graphics g = Graphics.FromImage(bitmap)) {
-                g.Clear(Color.Transparent);
+    private static Bitmap BuildBody(Bitmap source) {
+        Bitmap body = new Bitmap(source.Width, source.Height, PixelFormat.Format32bppPArgb);
+        using (Graphics g = Graphics.FromImage(body)) {
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.DrawImageUnscaled(source, 0, 0);
+            using (GraphicsPath mask = WaveMask(source.Width, source.Height))
+            using (SolidBrush clear = new SolidBrush(Color.Transparent)) {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                string[] candidates = new string[] { "Segoe Print", "Segoe Script", "Segoe UI" };
-                GraphicsPath glyphs = null;
-                FontFamily family = null;
-                RectangleF bounds = RectangleF.Empty;
-                try {
-                    foreach (string candidate in candidates) {
-                        try {
-                            family = new FontFamily(candidate);
-                            glyphs = new GraphicsPath();
-                            glyphs.AddString(text, family, (int)FontStyle.Bold, 40f, PointF.Empty, StringFormat.GenericDefault);
-                            bounds = glyphs.GetBounds();
-                            if (bounds.Width > 0.1f && bounds.Height > 0.1f) break;
-                            glyphs.Dispose(); glyphs = null; family.Dispose(); family = null;
-                        } catch {
-                            if (glyphs != null) { glyphs.Dispose(); glyphs = null; }
-                            if (family != null) { family.Dispose(); family = null; }
-                        }
-                    }
-                    if (glyphs == null || family == null) return bitmap;
-                    float marginX = Math.Max(2f, width * 0.012f);
-                    float marginY = Math.Max(2f, height * 0.06f);
-                    float scale = Math.Min((width - marginX * 2f) / bounds.Width,
-                                           (height - marginY * 2f) / bounds.Height);
-                    float drawWidth = bounds.Width * scale, drawHeight = bounds.Height * scale;
-                    using (Matrix transform = new Matrix(scale, 0f, 0f, scale,
-                        (width - drawWidth) / 2f - bounds.X * scale,
-                        (height - drawHeight) / 2f - bounds.Y * scale))
-                        glyphs.Transform(transform);
-                    RectangleF fitted = glyphs.GetBounds();
-                    Color start = dark ? Color.FromArgb(157, 184, 255) : Color.FromArgb(69, 111, 246);
-                    Color end = dark ? Color.FromArgb(207, 166, 255) : Color.FromArgb(145, 91, 221);
-                    using (LinearGradientBrush fill = new LinearGradientBrush(fitted, start, end, LinearGradientMode.Horizontal))
-                    using (Pen outline = new Pen(dark ? Color.FromArgb(54, 245, 245, 255) : Color.FromArgb(210, 255, 255, 255), Math.Max(0.7f, width / 520f))) {
-                        outline.LineJoin = LineJoin.Round;
-                        g.DrawPath(outline, glyphs);
-                        g.FillPath(fill, glyphs);
-                    }
-                } finally {
-                    if (glyphs != null) glyphs.Dispose();
-                    if (family != null) family.Dispose();
-                }
-            }
-            return bitmap;
-        } catch {
-            bitmap.Dispose();
-            throw;
-        }
-    }
-
-    private static GraphicsPath CreateFooterPath(string text, FontFamily family, float emSize) {
-        GraphicsPath path = new GraphicsPath();
-        if (!string.IsNullOrEmpty(text))
-            path.AddString(text, family, (int)FontStyle.Regular, emSize, PointF.Empty, StringFormat.GenericTypographic);
-        return path;
-    }
-
-    private static string NormalizeStage(string text) {
-        string value = (text ?? "").TrimEnd();
-        while (value.EndsWith("…", StringComparison.Ordinal) || value.EndsWith("...", StringComparison.Ordinal) || value.EndsWith(".", StringComparison.Ordinal)) {
-            if (value.EndsWith("...", StringComparison.Ordinal)) value = value.Substring(0, value.Length - 3).TrimEnd();
-            else value = value.Substring(0, value.Length - 1).TrimEnd();
-        }
-        return value;
-    }
-
-    private static bool IsTerminalStage(int percent, string stage) {
-        if (percent >= 100) return true;
-        string value = (stage ?? "").ToLowerInvariant();
-        return value.Contains("失败") || value.Contains("错误") || value.Contains("完成") ||
-               value.Contains("failed") || value.Contains("failure") || value.Contains("error") || value.Contains("complete") || value.Contains("done");
-    }
-
-    private static Bitmap BuildFooterArtwork(string text, int width, int height, float emSize, bool dark, bool warmPalette, bool reserveDots, bool roundedStageFont, out float inkRight) {
-        inkRight = 0f;
-        if (string.IsNullOrEmpty(text))
-            return new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
-        Bitmap bitmap = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
-        try {
-            using (Graphics g = Graphics.FromImage(bitmap)) {
-                g.Clear(Color.Transparent);
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                string[] candidates = roundedStageFont
-                    ? new string[] { "幼圆", "YouYuan", "KaiTi", "楷体", "Microsoft YaHei UI" }
-                    : new string[] { "KaiTi", "楷体", "Microsoft YaHei UI" };
-                FontFamily family = null;
-                GraphicsPath glyphs = null;
-                try {
-                    foreach (string candidate in candidates) {
-                        try {
-                            family = new FontFamily(candidate);
-                            glyphs = CreateFooterPath(text, family, emSize);
-                            if (glyphs.PointCount > 0) break;
-                            glyphs.Dispose(); glyphs = null; family.Dispose(); family = null;
-                        } catch {
-                            if (glyphs != null) { glyphs.Dispose(); glyphs = null; }
-                            if (family != null) { family.Dispose(); family = null; }
-                        }
-                    }
-                    if (glyphs == null || family == null) return bitmap;
-
-                    RectangleF measured = glyphs.GetBounds();
-                    float dotReserve = reserveDots ? Math.Max(1f, emSize * 1.35f) : 0f;
-                    float maxWidth = Math.Max(1f, width - 2f - dotReserve);
-                    if (measured.Width > maxWidth) {
-                        List<string> elements = new List<string>();
-                        System.Globalization.TextElementEnumerator iter = System.Globalization.StringInfo.GetTextElementEnumerator(text);
-                        while (iter.MoveNext()) elements.Add(iter.GetTextElement());
-                        int low = 0, high = elements.Count;
-                        GraphicsPath best = null;
-                        while (low <= high) {
-                            int count = low + (high - low) / 2;
-                            string candidateText = string.Concat(elements.GetRange(0, count).ToArray());
-                            if (!reserveDots && count < elements.Count) candidateText += "…";
-                            GraphicsPath trial = CreateFooterPath(candidateText, family, emSize);
-                            float candidateWidth = trial.GetBounds().Width;
-                            if (candidateWidth <= maxWidth) {
-                                if (best != null) best.Dispose();
-                                best = trial; low = count + 1;
-                            } else {
-                                trial.Dispose(); high = count - 1;
-                            }
-                        }
-                        glyphs.Dispose();
-                        glyphs = best ?? CreateFooterPath("", family, emSize);
-                        measured = glyphs.GetBounds();
-                    }
-
-                    float marginY = Math.Max(1f, height * 0.04f);
-                    float scale = Math.Min(1f, (height - marginY * 2f) / Math.Max(1f, measured.Height));
-                    float drawHeight = measured.Height * scale;
-                    using (Matrix transform = new Matrix(scale, 0f, 0f, scale,
-                        1f - measured.X * scale,
-                        (height - drawHeight) / 2f - measured.Y * scale))
-                        glyphs.Transform(transform);
-
-                    RectangleF fitted = glyphs.GetBounds();
-                    Color start, end;
-                    if (warmPalette) {
-                        start = dark ? Color.FromArgb(255, 183, 157) : Color.FromArgb(218, 91, 82);
-                        end = dark ? Color.FromArgb(255, 205, 184) : Color.FromArgb(196, 73, 127);
-                    } else {
-                        start = dark ? Color.FromArgb(124, 224, 236) : Color.FromArgb(12, 137, 166);
-                        end = dark ? Color.FromArgb(151, 228, 185) : Color.FromArgb(28, 151, 120);
-                    }
-                    using (LinearGradientBrush fill = new LinearGradientBrush(fitted, start, end, LinearGradientMode.Horizontal))
-                    using (Pen outline = new Pen(dark ? Color.FromArgb(54, 245, 245, 255) : Color.FromArgb(175, 255, 255, 255), 0.8f)) {
-                        outline.LineJoin = LineJoin.Round;
-                        g.DrawPath(outline, glyphs);
-                        g.FillPath(fill, glyphs);
-                    }
-                    inkRight = Math.Max(0f, fitted.Right + 1f);
-                } finally {
-                    if (glyphs != null) glyphs.Dispose();
-                    if (family != null) family.Dispose();
-                }
-            }
-            return bitmap;
-        } catch {
-            bitmap.Dispose();
-            throw;
-        }
-    }
-
-    private void UpdateTimeArtwork() {
-        TimeSpan elapsed = DateTime.Now - _start;
-        string text = elapsed.TotalHours >= 1
-            ? string.Format("用时  {0}:{1:00}:{2:00}", (int)elapsed.TotalHours, elapsed.Minutes, elapsed.Seconds)
-            : string.Format("用时  {0}:{1:00}", (int)elapsed.TotalMinutes, elapsed.Seconds);
-        if (text == _lastTimeText) return;
-        float ignoredInkRight;
-        Bitmap next = BuildFooterArtwork(text, S(230), S(24), S(18), _dark, true, false, false, out ignoredInkRight);
-        Bitmap old = _timeArt;
-        _timeArt = next;
-        _lastTimeText = text;
-        if (old != null) old.Dispose();
-        Invalidate(new Rectangle(S(48), S(216), S(240), S(32)));
-    }
-
-    private Rectangle GetDotBounds() {
-        int diameter = Math.Max(3, S(5));
-        float radius = diameter / 2f;
-        float spacing = S(7);
-        float firstX = S(52) + (int)Math.Ceiling(_stageInkRight) + S(7);
-        float lastRight = firstX + spacing * 2f + radius;
-        float baseY = S(178) + S(18);
-        float maxLift = S(4);
-        int padding = Math.Max(2, S(1));
-        int left = (int)Math.Floor(firstX - radius) - padding;
-        int top = (int)Math.Floor(baseY - maxLift - radius) - padding;
-        int right = (int)Math.Ceiling(lastRight) + padding;
-        int bottom = (int)Math.Ceiling(baseY + radius) + padding;
-        return Rectangle.FromLTRB(left, top, right, bottom);
-    }
-
-    private void DrawLoadingDots(Graphics g) {
-        if (!_isLoading || _dotBounds.IsEmpty) return;
-        int diameter = Math.Max(3, S(5));
-        float radius = diameter / 2f;
-        float baseY = S(178) + S(18);
-        int firstX = S(52) + (int)Math.Ceiling(_stageInkRight) + S(7);
-        Color dotColor = _dark ? Color.FromArgb(151, 228, 185) : Color.FromArgb(28, 151, 120);
-        using (SolidBrush brush = new SolidBrush(dotColor)) {
-            for (int i = 0; i < 3; i++) {
-                double phase = _dotPhase - i * Math.PI * 0.72;
-                float lift = (float)Math.Max(0.0, Math.Sin(phase)) * S(4);
-                float x = firstX + i * S(7) - radius;
-                float y = baseY - lift - radius;
-                g.FillEllipse(brush, x, y, diameter, diameter);
+                g.FillPath(clear, mask);
             }
         }
+        return body;
     }
 
-    private int MascotRightAt(int physicalY) {
-        if (_mascot == null) return S(468);
-        int top = S(4), left = S(435);
-        int row = physicalY - top;
-        if (row < 0 || row >= _mascot.Height) return -1;
-        for (int x = _mascot.Width - 1; x >= 0; x--) {
-            if (_mascot.GetPixel(x, row).A >= 12) return left + x;
-        }
-        return -1;
-    }
-
-    private GraphicsPath CardPath() {
-        int left = S(24), top = S(60), bottom = S(340), radius = S(18);
-        int d = Math.Max(2, radius * 2);
-        List<Point> edge = new List<Point>();
-        int previous = S(470);
-        int step = Math.Max(1, S(1));
-        for (int y = top; y <= bottom; y += step) {
-            int right = MascotRightAt(y);
-            if (right >= 0) previous = right + Math.Max(1, S(1));
-            edge.Add(new Point(Math.Min(ClientSize.Width - 1, previous), y));
-        }
-        if (edge.Count == 0 || edge[edge.Count - 1].Y != bottom)
-            edge.Add(new Point(Math.Min(ClientSize.Width - 1, previous), bottom));
-
-        GraphicsPath path = new GraphicsPath();
-        path.StartFigure();
-        path.AddLine(left + radius, top, edge[0].X, top);
-        if (edge.Count > 1) path.AddLines(edge.ToArray());
-        path.AddLine(edge[edge.Count - 1].X, bottom, left + radius, bottom);
-        path.AddArc(left, bottom - d, d, d, 90, 90);
-        path.AddLine(left, bottom - radius, left, top + radius);
-        path.AddArc(left, top, d, d, 180, 90);
-        path.CloseFigure();
-        return path;
-    }
-
-    private GraphicsPath MascotRegionPath() {
-        GraphicsPath path = new GraphicsPath();
-        if (_mascot == null) return path;
-        int left = S(435), top = S(4), cardTop = S(60);
-        int rowsAboveCard = Math.Min(_mascot.Height, cardTop - top);
-        // The card contains the entire mascot below its top edge; only add
-        // pixels above it so the head can overhang without a rectangular HWND.
-        for (int y = 0; y < rowsAboveCard; y++) {
-            int x = 0;
-            while (x < _mascot.Width) {
-                while (x < _mascot.Width && _mascot.GetPixel(x, y).A < 12) x++;
-                int start = x;
-                while (x < _mascot.Width && _mascot.GetPixel(x, y).A >= 12) x++;
-                if (x > start) path.AddRectangle(new Rectangle(left + start, top + y, x - start, 1));
-            }
-        }
-        return path;
-    }
-
-    private void UpdateWindowRegion() {
-        if (_updatingRegion || !IsHandleCreated || IsDisposed || ClientSize.Width < 2 || ClientSize.Height < 2) return;
-        if (_regionSize == ClientSize && Region != null) return;
-        _updatingRegion = true;
-        try {
-            using (GraphicsPath card = CardPath())
-            using (GraphicsPath figure = MascotRegionPath()) {
-                Region combined = new Region(card);
-                if (figure.PointCount > 0) combined.Union(figure);
-                using (Region clientBounds = new Region(new Rectangle(Point.Empty, ClientSize)))
-                    combined.Intersect(clientBounds);
-                // Control.Region owns the assigned object and releases its predecessor.
-                Region = combined;
-            }
-            _regionSize = ClientSize;
-        } finally {
-            _updatingRegion = false;
-        }
-    }
-
-    private Bitmap BuildBackground(int width, int height) {
-        Bitmap b = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
-        using (Graphics g = Graphics.FromImage(b)) {
+    private static Bitmap BuildWaveLayer(Bitmap source) {
+        Bitmap layer = new Bitmap(source.Width, source.Height, PixelFormat.Format32bppPArgb);
+        using (Graphics g = Graphics.FromImage(layer)) {
             g.Clear(Color.Transparent);
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            Rectangle bounds = new Rectangle(0, 0, width, height);
-            using (GraphicsPath card = CardPath())
-            using (LinearGradientBrush fill = new LinearGradientBrush(bounds, _bg, _bgEnd, LinearGradientMode.Vertical))
-                g.FillPath(fill, card);
+            using (GraphicsPath mask = WaveMask(source.Width, source.Height)) {
+                g.SetClip(mask);
+                g.DrawImageUnscaled(source, 0, 0);
+                g.ResetClip();
+            }
         }
-        return b;
+        return layer;
     }
 
-    private void RebuildBackground() {
-        Bitmap next = BuildBackground(ClientSize.Width, ClientSize.Height);
-        Bitmap old = _background;
-        _background = next;
-        if (old != null) old.Dispose();
+    private float CurrentWaveAngle() {
+        double t = (DateTime.UtcNow - _animationStart).TotalMilliseconds / 1000.0;
+        return (float)(16.0 * Math.Sin(t * Math.PI * 2.0 / 0.8));
     }
 
-    protected override CreateParams CreateParams {
-        get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x80; return cp; }
+    private void DrawBubble(Graphics g) {
+        float x=S(18), y=S(28), w=S(150), h=S(82), radius=S(23);
+        using (GraphicsPath shape = new GraphicsPath()) {
+            shape.StartFigure();
+            shape.AddArc(x, y, radius, radius, 180, 90);
+            shape.AddLine(x+radius/2, y, x+w-radius/2, y);
+            shape.AddArc(x+w-radius, y, radius, radius, 270, 90);
+            shape.AddLine(x+w, y+radius/2, x+w, y+h-radius/2);
+            shape.AddArc(x+w-radius, y+h-radius, radius, radius, 0, 90);
+            shape.AddLine(x+w-radius/2, y+h, x+w-S(26), y+h);
+            shape.AddLine(x+w-S(26), y+h, S(212), S(156));
+            shape.AddLine(S(212), S(156), x+w-S(55), y+h);
+            shape.AddLine(x+w-S(55), y+h, x+radius/2, y+h);
+            shape.AddArc(x, y+h-radius, radius, radius, 90, 90);
+            shape.AddLine(x, y+h-radius/2, x, y+radius/2);
+            shape.CloseFigure();
+            using (SolidBrush fill = new SolidBrush(_bubbleFill))
+            using (Pen edge = new Pen(_bubbleEdge, Math.Max(1f, S(1.6f)))) {
+                edge.LineJoin = LineJoin.Round;
+                g.FillPath(fill, shape);
+                g.DrawPath(edge, shape);
+            }
+        }
+        using (SolidBrush ink = new SolidBrush(_bubbleInk)) {
+            StringFormat format = new StringFormat(); format.Alignment = StringAlignment.Center; format.LineAlignment = StringAlignment.Center;
+            g.DrawString("再见", _bubbleFont, ink, new RectangleF(S(28), S(39), S(130), S(53)), format);
+            format.Dispose();
+        }
     }
 
-    protected override void OnHandleCreated(EventArgs e) {
-        base.OnHandleCreated(e);
+    private void RenderScene(float waveDegrees) {
+        _frameGraphics.Clear(Color.Transparent);
+        Rectangle mascotRect = new Rectangle(S(MascotX), S(MascotY), S(MascotWidth), S(MascotHeight));
+        _frameGraphics.DrawImage(_body, mascotRect);
+        float pivotX = mascotRect.X + mascotRect.Width * (285f / 1178f);
+        float pivotY = mascotRect.Y + mascotRect.Height * (635f / 1335f);
+        GraphicsState saved = _frameGraphics.Save();
+        _frameGraphics.TranslateTransform(pivotX, pivotY);
+        _frameGraphics.RotateTransform(waveDegrees);
+        _frameGraphics.TranslateTransform(-pivotX, -pivotY);
+        _frameGraphics.DrawImage(_waveLayer, mascotRect);
+        _frameGraphics.Restore(saved);
+        DrawBubble(_frameGraphics);
+    }
+
+    public void ExportFrameForTesting(string path, float waveDegrees) {
+        RenderScene(waveDegrees);
+        _frame.Save(path, ImageFormat.Png);
+    }
+
+    private void UpdateLayeredFrame(float waveDegrees) {
+        if (!IsHandleCreated || IsDisposed) return;
+        RenderScene(waveDegrees);
+        BitmapData data = _frame.LockBits(new Rectangle(0, 0, _frame.Width, _frame.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
         try {
-            _regionSize = Size.Empty;
-            UpdateWindowRegion();
-            int policy = 2; DwmSetWindowAttribute(Handle, 2, ref policy, 4);
-        } catch { }
-    }
-
-    protected override void OnSizeChanged(EventArgs e) {
-        base.OnSizeChanged(e);
-        if (_updatingRegion || !IsHandleCreated || IsDisposed) return;
+            byte[] row = new byte[_frame.Width * 4];
+            for (int y=0;y<_frame.Height;y++) {
+                IntPtr source = IntPtr.Add(data.Scan0, y * data.Stride);
+                Marshal.Copy(source, row, 0, row.Length);
+                Marshal.Copy(row, 0, IntPtr.Add(_dibBits, y * _frame.Width * 4), row.Length);
+            }
+        } finally { _frame.UnlockBits(data); }
+        IntPtr screen = GetDC(IntPtr.Zero);
         try {
-            RebuildBackground();
-            _regionSize = Size.Empty;
-            UpdateWindowRegion();
-            Invalidate();
-        } catch { }
+            PointNative destination = new PointNative(Left, Top), source = new PointNative(0, 0);
+            SizeNative size = new SizeNative(_frame.Width, _frame.Height);
+            BlendFunction blend = new BlendFunction(); blend.BlendOp=0; blend.BlendFlags=0; blend.SourceConstantAlpha=255; blend.AlphaFormat=1;
+            _nativeReady = UpdateLayeredWindow(Handle, screen, ref destination, ref size, _memoryDc, ref source, 0, ref blend, 2);
+            if (!_nativeReady) throw new InvalidOperationException("UpdateLayeredWindow failed: " + Marshal.GetLastWin32Error());
+        } finally { ReleaseDC(IntPtr.Zero, screen); }
     }
 
     protected override void OnLoad(EventArgs e) {
         base.OnLoad(e);
-        Rectangle wa = Screen.FromPoint(Cursor.Position).WorkingArea;
-        Location = new Point(wa.X + (wa.Width - Width) / 2, wa.Y + (wa.Height - Height) / 2);
+        Rectangle area = Screen.FromPoint(Cursor.Position).WorkingArea;
+        Location = new Point(area.X + (area.Width-Width)/2, area.Y + (area.Height-Height)/2);
+        UpdateLayeredFrame(CurrentWaveAngle());
     }
-
-    private static GraphicsPath Pill(RectangleF r) {
-        GraphicsPath p = new GraphicsPath();
-        float d = r.Height;
-        p.AddArc(r.X, r.Y, d, d, 90, 180);
-        p.AddArc(r.Right-d, r.Y, d, d, 270, 180);
-        p.CloseFigure();
-        return p;
-    }
+    protected override void OnPaintBackground(PaintEventArgs e) { }
+    protected override void OnPaint(PaintEventArgs e) { }
 
     public void SetProgress(int percent, string stage) {
         _shown = Math.Max(0, Math.Min(100, percent));
-        string normalized = NormalizeStage(stage);
-        bool loading = !IsTerminalStage(_shown, normalized);
-        bool changed = stage != Stage;
-        bool loadingChanged = loading != _isLoading;
-        Rectangle previousDots = _dotBounds;
-        _isLoading = loading;
-        if (changed || loadingChanged) {
-            if (changed) { Stage = stage; Text = stage; }
-            Bitmap next = BuildFooterArtwork(normalized, S(430), S(36), S(24), _dark, false, _isLoading, true, out _stageInkRight);
-            Bitmap old = _stageArt;
-            _stageArt = next;
-            if (old != null) old.Dispose();
-            _dotBounds = GetDotBounds();
-        }
-        if (loadingChanged) {
-            if (_isLoading) _dotPhase = 0f;
-            Invalidate(previousDots);
-            Invalidate(_dotBounds);
-        }
-        if (changed) {
-            Invalidate(new Rectangle(S(48), S(172), S(450), S(52)));
-        }
-        Invalidate(new Rectangle(S(48), S(292), S(430), S(18)));
-    }
-
-    protected override void OnPaint(PaintEventArgs e) {
-        Graphics g = e.Graphics;
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-        if (_background != null) g.DrawImageUnscaled(_background, 0, 0);
-        else g.Clear(_bg);
-
-        if (_logo != null) g.DrawImageUnscaled(_logo, S(50), S(101));
-        if (_wordmark != null) g.DrawImageUnscaled(_wordmark, S(106), S(98));
-        if (_stageArt != null) g.DrawImageUnscaled(_stageArt, S(52), S(178));
-        DrawLoadingDots(g);
-        if (_timeArt != null) g.DrawImageUnscaled(_timeArt, S(52), S(220));
-
-        RectangleF track = new RectangleF(S(52), S(296), S(420), S(10));
-        using (GraphicsPath tp = Pill(track))
-        using (SolidBrush tb = new SolidBrush(_track)) g.FillPath(tb, tp);
-        float w = track.Width * _shown / 100f;
-        if (w > 0.5f) {
-            RectangleF fill = new RectangleF(track.X, track.Y, Math.Max(w, track.Height), track.Height);
-            using (GraphicsPath fp = Pill(fill))
-            using (LinearGradientBrush accent = new LinearGradientBrush(track, Accent1, Accent2, LinearGradientMode.Horizontal))
-                g.FillPath(accent, fp);
-        }
-        if (_mascot != null) g.DrawImageUnscaled(_mascot, S(435), S(4));
-    }
-
-    protected override void OnFormClosed(FormClosedEventArgs e) {
-        if (_tick != null) _tick.Stop();
-        base.OnFormClosed(e);
+        _stage = stage ?? "";
+        // Keep lifecycle/test state observable through the HWND title only.
+        Text = _stage;
     }
 
     protected override void Dispose(bool disposing) {
-        if (disposing) {
-            if (_tick != null) { _tick.Stop(); _tick.Dispose(); }
-            if (_logo != null) _logo.Dispose();
+        if (disposing && !_resourcesReleased) {
+            _resourcesReleased = true;
+            if (_animation != null) { _animation.Stop(); _animation.Dispose(); }
+            if (_frameGraphics != null) _frameGraphics.Dispose();
+            if (_frame != null) _frame.Dispose();
+            if (_body != null) _body.Dispose();
+            if (_waveLayer != null) _waveLayer.Dispose();
             if (_mascot != null) _mascot.Dispose();
-            if (_background != null) _background.Dispose();
-            if (_wordmark != null) _wordmark.Dispose();
-            if (_stageArt != null) _stageArt.Dispose();
-            if (_timeArt != null) _timeArt.Dispose();
+            if (_bubbleFont != null) _bubbleFont.Dispose();
+            if (_memoryDc != IntPtr.Zero) {
+                if (_previousObject != IntPtr.Zero) SelectObject(_memoryDc, _previousObject);
+                if (_dib != IntPtr.Zero) DeleteObject(_dib);
+                DeleteDC(_memoryDc);
+            }
         }
         base.Dispose(disposing);
     }
@@ -550,66 +283,56 @@ public static class DshProgress {
     private static readonly ManualResetEvent _ready = new ManualResetEvent(false);
     private static string _failure = "";
     public static string Failure { get { return _failure; } }
-
-    // PowerShell runspaces are not available on arbitrary ThreadPool threads.
-    // Keep the blocking console read inside compiled C# instead.
-    public static Task<string> ReadCommandAsync() {
-        return Task.Factory.StartNew<string>(() => Console.In.ReadLine());
-    }
+    public static Task<string> ReadCommandAsync() { return Task.Factory.StartNew<string>(() => Console.In.ReadLine()); }
 
     public static bool Show(string title, string stage, string logoPath) {
-        string mascotPath = Path.Combine(Path.GetDirectoryName(logoPath) ?? "", "whale-maid-static.png");
-        return Show(title, stage, logoPath, mascotPath, true);
+        return Show(title, stage, logoPath, Path.Combine(Path.GetDirectoryName(logoPath) ?? "", "whale-maid-goodbye.png"), true);
     }
     public static bool Show(string title, string stage, string logoPath, bool staticMascot) {
-        string mascotPath = Path.Combine(Path.GetDirectoryName(logoPath) ?? "", "whale-maid-static.png");
-        return Show(title, stage, logoPath, mascotPath, true);
+        return Show(title, stage, logoPath, Path.Combine(Path.GetDirectoryName(logoPath) ?? "", "whale-maid-goodbye.png"), true);
     }
     public static bool Show(string title, string stage, string logoPath, string mascotPath, bool staticMascot) {
         lock (_lock) {
             if (_thread != null && _thread.IsAlive) return _form != null;
             _thread = null; _form = null; _failure = ""; _ready.Reset();
             _thread = new Thread(delegate() {
+                DshProgressForm form = null;
                 try {
+                    Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
                     try { SetProcessDPIAware(); } catch { }
                     Application.EnableVisualStyles();
-                    DshProgressForm f = new DshProgressForm(title, stage, logoPath, mascotPath);
-                    IntPtr handle = f.Handle;
-                    _form = f;
-                    f.Shown += delegate(object sender, EventArgs args) {
-                        // Shown runs after the HWND is visible. Queue the signal once
-                        // more so the first message-pump turn has completed too.
-                        try { f.BeginInvoke((MethodInvoker)delegate() { _ready.Set(); }); }
+                    form = new DshProgressForm(title, stage, logoPath, mascotPath);
+                    IntPtr handle = form.Handle;
+                    _form = form;
+                    form.Shown += delegate(object sender, EventArgs args) {
+                        try { form.BeginInvoke((MethodInvoker)delegate() { _ready.Set(); }); }
                         catch (InvalidOperationException) { }
                     };
-                    Application.Run(f);
+                    Application.Run(form);
                 } catch (Exception ex) {
-                    _failure = ex.ToString();
-                    _ready.Set();
+                    _failure = ex.ToString(); _ready.Set();
+                } finally {
+                    if (form != null && !form.IsDisposed) form.Dispose();
                 }
             });
             _thread.SetApartmentState(ApartmentState.STA);
             _thread.IsBackground = true;
             _thread.Start();
         }
-        return _ready.WaitOne(4500) && _form != null && string.IsNullOrEmpty(_failure);
+        return _ready.WaitOne(4500) && _form != null && String.IsNullOrEmpty(_failure);
     }
     public static void SetStage(int percent, string stage) {
-        DshProgressForm f;
-        lock (_lock) { f = _form; }
-        if (f == null || f.IsDisposed) return;
-        int p = Math.Max(0, Math.Min(100, percent));
-        try { f.BeginInvoke((MethodInvoker)delegate() { f.SetProgress(p, stage); }); }
-        catch (InvalidOperationException) { }
+        DshProgressForm form; lock (_lock) { form = _form; }
+        if (form == null || form.IsDisposed) return;
+        try { form.BeginInvoke((MethodInvoker)delegate { form.SetProgress(percent, stage); }); } catch (InvalidOperationException) { }
     }
     public static void Close() {
-        DshProgressForm f; Thread t;
-        lock (_lock) { f = _form; t = _thread; _form = null; }
-        if (f != null && !f.IsDisposed) {
-            try { f.BeginInvoke((MethodInvoker)delegate() { f.Close(); }); }
-            catch (InvalidOperationException) { }
+        DshProgressForm form; Thread thread;
+        lock (_lock) { form = _form; thread = _thread; _form = null; }
+        if (form != null && !form.IsDisposed) {
+            try { form.BeginInvoke((MethodInvoker)delegate { form.Close(); }); } catch (InvalidOperationException) { }
         }
-        if (t != null && t != Thread.CurrentThread && t.Join(3000))
-            lock (_lock) { if (_thread == t) { _thread = null; _form = null; } }
+        if (thread != null && thread != Thread.CurrentThread && thread.Join(3000))
+            lock (_lock) { if (_thread == thread) { _thread = null; _form = null; } }
     }
 }

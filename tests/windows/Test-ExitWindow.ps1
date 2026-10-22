@@ -11,8 +11,7 @@ $helperRoot = Join-Path $tempRoot '插件 路径 带空格'
 New-Item -ItemType Directory -Path $helperRoot -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $sourceRoot 'exit-window.ps1'),
     (Join-Path $sourceRoot 'renderer.cs'),
-    (Join-Path $sourceRoot 'deepseek-logo.png'),
-    (Join-Path $sourceRoot 'whale-maid-static.png') -Destination $helperRoot
+    (Join-Path $sourceRoot 'whale-maid-goodbye.png') -Destination $helperRoot
 $helperPath = Join-Path $helperRoot 'exit-window.ps1'
 
 Add-Type -TypeDefinition @"
@@ -27,9 +26,9 @@ public static class ExitWindowTestProbe {
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr h, StringBuilder text, int max);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] private static extern IntPtr GetWindowLongPtr(IntPtr h, int index);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr h, out Rect rect);
     [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr h, out Rect rect);
-    [DllImport("user32.dll")] private static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("kernel32.dll", SetLastError=true)] private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
     [DllImport("kernel32.dll", CharSet=CharSet.Auto)] private static extern bool Process32First(IntPtr snapshot, ref ProcessEntry entry);
@@ -85,17 +84,13 @@ public static class ExitWindowTestProbe {
         Rect wr, cr; GetWindowRect(h, out wr); GetClientRect(h, out cr);
         return String.Format("window={0}x{1}, client={2}x{3}", wr.Right-wr.Left, wr.Bottom-wr.Top, cr.Right-cr.Left, cr.Bottom-cr.Top);
     }
-    public static void Capture(IntPtr h, string path) {
+    public static void ValidateLayeredWindow(IntPtr h) {
         Rect rect; if (!GetWindowRect(h, out rect)) throw new InvalidOperationException("GetWindowRect failed.");
         int width = rect.Right - rect.Left, height = rect.Bottom - rect.Top;
-        if (width < 700 || height < 300) throw new InvalidOperationException("Unexpectedly small DPI-aware window bounds: " + Dimensions(h));
-        using (Bitmap bitmap = new Bitmap(width, height))
-        using (Graphics graphics = Graphics.FromImage(bitmap)) {
-            IntPtr dc = graphics.GetHdc();
-            try { if (!PrintWindow(h, dc, 2)) throw new InvalidOperationException("PrintWindow failed for " + Dimensions(h)); }
-            finally { graphics.ReleaseHdc(dc); }
-            bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
-        }
+        if (width < 380 || height < 330 || Math.Abs((float)width / height - 420f / 370f) > 0.08f)
+            throw new InvalidOperationException("Unexpected DPI-aware layered window bounds: " + Dimensions(h));
+        if ((GetWindowLongPtr(h, -20).ToInt64() & 0x00080000L) == 0)
+            throw new InvalidOperationException("The goodbye HWND is not a per-pixel layered window.");
     }
 }
 "@ -ReferencedAssemblies @('System.Drawing.dll')
@@ -193,11 +188,7 @@ try {
     $hwnd = Wait-VisibleWindow $helper
     if ([ExitWindowTestProbe]::Title($hwnd) -ne 'DeepSeek Harness') { throw 'The visible window title did not match.' }
     Write-Output ("Live helper window " + [ExitWindowTestProbe]::Dimensions($hwnd))
-    if (-not $SkipScreenshot) {
-        $artifactDir = Join-Path $PSScriptRoot 'artifacts'
-        New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
-        [ExitWindowTestProbe]::Capture($hwnd, (Join-Path $artifactDir 'exit-window.png'))
-    }
+    [ExitWindowTestProbe]::ValidateLayeredWindow($hwnd)
     $helper.StandardInput.WriteLine('COMMIT')
     $helper.StandardInput.Flush()
     if ((Read-LineWithTimeout $helper) -cne 'COMMITTED') { throw 'Expected COMMITTED after COMMIT.' }
@@ -213,9 +204,7 @@ try {
     $exitTimer = [Diagnostics.Stopwatch]::StartNew()
     $parent.Kill()
     $completeHwnd = Wait-WindowTitle -ProcessId $helper.Id -ExpectedTitle '已退出'
-    if (-not $SkipScreenshot) {
-        [ExitWindowTestProbe]::Capture($completeHwnd, (Join-Path $artifactDir 'exit-window-complete.png'))
-    }
+    [ExitWindowTestProbe]::ValidateLayeredWindow($completeHwnd)
     Wait-HelperExit $helper
     if ($exitTimer.ElapsedMilliseconds -lt 750) { throw 'The success state was not left visible for approximately one second.' }
     $parent.Dispose(); $helper.Dispose()
@@ -282,9 +271,7 @@ try {
     [void]$owned.Add($preview)
     [void](Wait-VisibleWindow $preview)
     $previewHwnd = Wait-WindowTitle -ProcessId $preview.Id -ExpectedTitle '已退出' -TimeoutMs 5000
-    if (-not $SkipScreenshot) {
-        [ExitWindowTestProbe]::Capture($previewHwnd, (Join-Path $artifactDir 'exit-window-complete.png'))
-    }
+    [ExitWindowTestProbe]::ValidateLayeredWindow($previewHwnd)
     Wait-HelperExit $preview -TimeoutMs 8000
     if ($preview.StandardOutput.ReadToEnd() -ne '') { throw 'Preview wrote protocol data to stdout.' }
 
@@ -362,9 +349,7 @@ session = createExitWindow({
     $nodeHelper.Refresh(); $bootstrap.Refresh()
     if ($nodeHelper.HasExited -or $bootstrap.HasExited) { throw 'Bootstrap or PowerShell helper did not survive the Node controller exit.' }
     $nodeCompleteHwnd = Wait-WindowTitle -ProcessId $nodeHelper.Id -ExpectedTitle '已退出'
-    if (-not $SkipScreenshot) {
-        [ExitWindowTestProbe]::Capture($nodeCompleteHwnd, (Join-Path $artifactDir 'exit-window-node-complete.png'))
-    }
+    [ExitWindowTestProbe]::ValidateLayeredWindow($nodeCompleteHwnd)
     Wait-HelperExit $nodeHelper -TimeoutMs 8000
     Wait-HelperExit $bootstrap -TimeoutMs 8000
     $node.Dispose(); $nodeHelper.Dispose(); $bootstrap.Dispose()
@@ -400,10 +385,7 @@ session = createExitWindow({
     $cancelNode.Dispose(); $cancelBootstrap.Dispose(); $cancelHelper.Dispose()
 
     Write-Output "PASS: direct and Node/bootstrap ready/commit handoff, pipe release after COMMITTED, parent-still-running behavior, successful parent exit, pre-COMMIT EOF and parent exit, cancellation subtree cleanup, short max lifetime, Preview completion, and Chinese/space-containing helper path."
-    if (-not $SkipScreenshot) {
-        $screenshotPath = Join-Path $PSScriptRoot "artifacts\exit-window.png"
-        Write-Output ("Screenshot: " + $screenshotPath)
-    }
+    Write-Output ("UI preview frames and animation: " + (Join-Path $PSScriptRoot "artifacts\exit-window-wave-left.png") + " and goodbye-animation.gif")
 } finally {
     foreach ($process in $owned) {
         try { $process.Refresh(); if (-not $process.HasExited) { $process.Kill(); [void]$process.WaitForExit(3000) } } catch { }

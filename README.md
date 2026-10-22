@@ -1,10 +1,10 @@
 # dsh-auto-shutdown
 
 A [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) plugin that shuts the dsh instance down
-once the web UI stays disconnected past a short grace period, with a Windows exit progress window.
+once the web UI stays disconnected past a short grace period, with an animated goodbye mascot on Windows.
 
 面向 Windows 的 DeepSeek Harness 插件：浏览器页面全部断开并持续超过宽限期（默认 5 秒）后，让 dsh 实例优雅退出。
-宽限期结束后弹出与 Windows 启动器一致的鲸鱼女仆卡片，显示“正在关闭…”及用时；确认 dsh 进程结束后显示“已退出”，约 1 秒后自动收起。无需点击确认。
+宽限期结束后出现透明背景的小鲸鱼角色，向你挥手告别；旁边的聊天气泡指向角色，只写“再见”。确认 dsh 进程结束后，告别动画约 1 秒后自动收起。无需点击确认。
 
 检测逻辑跑在 dsh 服务进程内，窗口由独立的 PowerShell 进程显示，并由一个临时 Node 托管进程陪伴运行，因此能在 dsh 结束后继续显示退出结果。两者均隐藏控制台，窗口结束后自动退出。窗口代码和素材均包含在本插件中，无需安装 `dsh-windows-launcher`。
 
@@ -29,7 +29,7 @@ dsh 在启动时会用 `engines.dsh` 校验插件；不在范围内会被整包�
 安装本次稳定版：
 
 ```powershell
-git clone --branch v0.2.0 https://github.com/xy-12177/dsh-auto-shutdown.git
+git clone --branch v0.2.1 https://github.com/xy-12177/dsh-auto-shutdown.git
 cd dsh-auto-shutdown
 dsh plugin --profile web add .
 ```
@@ -38,7 +38,7 @@ dsh plugin --profile web add .
 
 装完如果已经有 `dsh web` 在跑，先重启它，插件才会加载。
 
-也可以从 [GitHub Releases](https://github.com/xy-12177/dsh-auto-shutdown/releases/latest) 下载 ZIP 安装包，解压后进入 `dsh-auto-shutdown` 文件夹，执行 `dsh plugin --profile web add .`。安装目录同样需要保留。已有链接安装的用户可在原目录运行 `git fetch origin --tags`、`git checkout v0.2.0`，然后重启 dsh。
+也可以从 [GitHub Releases](https://github.com/xy-12177/dsh-auto-shutdown/releases/latest) 下载 ZIP 安装包，解压后进入 `dsh-auto-shutdown` 文件夹，执行 `dsh plugin --profile web add .`。安装目录同样需要保留。已有链接安装的用户可在原目录运行 `git fetch origin --tags`、`git checkout v0.2.1`，然后重启 dsh。
 
 版本变化见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -56,7 +56,7 @@ dsh plugin --profile web remove dsh-auto-shutdown
 
 窗口显示前的准备最多等待 5 秒，交接确认最多再等待 1 秒；正常耗时取决于 PowerShell 和窗口编译速度。失败时继续关闭 dsh，不因窗口失败阻塞退出。准备期间页面重连会取消退出；提交交接后继续完成退出。
 
-窗口使用保留的进程句柄观察 dsh 是否结束，仅进程真正结束才显示“已退出”。窗口接管后最多存活 30 秒，超时自行收起，不误报成功，也不额外杀进程。非 Windows 环境保持原有无窗口退出行为。
+窗口使用保留的进程句柄观察 dsh 是否结束，确认结束后继续挥手约 1 秒再收起。气泡文案始终为“再见”。窗口接管后最多存活 30 秒，超时自行收起，也不额外杀进程。非 Windows 环境保持原有无窗口退出行为。
 
 在 profile 的 `cordis.patch.yml` 里可以覆盖以下配置：
 
@@ -66,7 +66,7 @@ dsh plugin --profile web remove dsh-auto-shutdown
 | `pollMs` | `1000` | 采样间隔 |
 | `disconnectGraceMs` | `5000` | 断开多久才开始退出；能盖住刷新标签页、短暂睡眠。`0` = 检测到断开即开始 |
 | `requireEverConnected` | `true` | 至少连上过一次 UI 才开始计时（`--no-open` 这类启动不会被误杀） |
-| `showExitWindow` | `true` | Windows 退出卡片；设为 `false` 恢复原有无窗口退出行为 |
+| `showExitWindow` | `true` | Windows 挥手告别动画；设为 `false` 恢复原有无窗口退出行为 |
 
 ```yaml
 - id: auto-shutdown

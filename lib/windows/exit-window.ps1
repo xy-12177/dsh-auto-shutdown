@@ -2,7 +2,7 @@
 .SYNOPSIS
 Displays the automatic shutdown window for dsh-auto-shutdown.
 
-The Node host starts this script detached with redirected stdin/stdout/stderr.
+The detached Node supervisor starts this helper with inherited protocol pipes.
 Only READY and COMMITTED protocol lines are written to stdout; diagnostics go
 to stderr. -Preview exercises the window without a parent process or dsh IO.
 #>
@@ -36,9 +36,8 @@ try {
     $renderer = [System.IO.File]::ReadAllText($rendererPath, [System.Text.Encoding]::UTF8)
     Add-Type -TypeDefinition $renderer -ReferencedAssemblies @('System.Windows.Forms.dll', 'System.Drawing.dll')
 
-    $logoPath = Join-Path $PSScriptRoot 'deepseek-logo.png'
-    $mascotPath = Join-Path $PSScriptRoot 'whale-maid-static.png'
-    if (-not [DshProgress]::Show('DeepSeek Harness', '正在关闭…', $logoPath, $mascotPath, $true)) {
+    $mascotPath = Join-Path $PSScriptRoot 'whale-maid-goodbye.png'
+    if (-not [DshProgress]::Show('DeepSeek Harness', '再见', '', $mascotPath, $true)) {
         throw 'The exit window did not become visible within its startup timeout.'
     }
 
@@ -89,8 +88,8 @@ try {
         }
     }
 
-    # The maximum lifetime is a safety cap. Closing at the cap must never look
-    # like a successful shutdown, so leave the loading stage unchanged.
+    # The maximum lifetime is a safety cap. Only observed process termination
+    # changes the internal completion state; the visible bubble stays "再见".
     [DshProgress]::Close()
     exit 0
 } catch {
