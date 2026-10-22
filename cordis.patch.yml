@@ -11,3 +11,4 @@
         enabled: true
         pollMs: 1000
         requireEverConnected: true
+        showExitWindow: true

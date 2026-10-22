@@ -1,0 +1,4 @@
+node_modules/
+*.tgz
+tests/windows/artifacts/
+release/
